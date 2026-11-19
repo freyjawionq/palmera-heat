@@ -215,10 +215,10 @@ export function collideCarWithWorld(car, events, isPlayerCar) {
   for (const other of allCars()) {
     if (other === car) continue;
     if (car.driver === 'traffic' && other.driver === 'parked') continue;
-    // One impact bills once: several circle pairs of the same two cars can
-    // overlap in a single call, but the crash damage and event apply only
-    // to the first of them. Push-apart and speed damping stay per pair.
-    let pairDamaged = false;
+    // One contact, one bill: however many of this pair's circles overlap
+    // in this call, crash damage and the crash event are charged only on
+    // the first hard hit. Push-apart and speed loss still apply per circle.
+    let pairBilled = false;
     for (const a of carCircles(car)) {
       for (const b of carCircles(other)) {
         const d = dist(a.x, a.y, b.x, b.y);
@@ -229,8 +229,8 @@ export function collideCarWithWorld(car, events, isPlayerCar) {
           car.x += ux * push; car.y += uy * push;
           if (other.driver !== 'parked') { other.x -= ux * push; other.y -= uy * push; }
           const impact = Math.abs(car.speed - other.speed);
-          if (impact > 60 && !pairDamaged) {
-            pairDamaged = true;
+          if (impact > 60 && !pairBilled) {
+            pairBilled = true;
             car.hp -= impact * 0.05; other.hp -= impact * 0.04;
             if (events) events.push({ kind: 'crash', hard: impact > 130, car, other, player: isPlayerCar });
           }

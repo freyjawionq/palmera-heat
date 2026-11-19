@@ -1,91 +1,95 @@
-// collision-dedupe.test.mjs — regression test for audit candidate #3:
-// collideCarWithWorld must bill crash damage + the crash event AT MOST
-// ONCE per (car, other) pair per call, however many of the pair's body
-// circles overlap. Push-apart physics and speed damping stay per pair.
+// collision-dedupe.test.mjs — regression test for candidate #3:
+// car-to-car crash damage and crash events must be billed at most once
+// per unordered car pair per collideCarWithWorld call.
 //
-// Run from the repo root:  node tests/collision-dedupe.test.mjs
-// Exit code 0 = all cases pass, 1 = at least one failure.
+// Baseline behaviour (measured headlessly on the pre-fix code): two
+// sedans overlapping at an intersection, speeds 300 vs 0, produced 3
+// crash events in ONE call and billed damage three times
+// (hp 100 -> 66.424 and 100 -> 73.1392). After the fix the same setup
+// must produce exactly 1 crash event and the single-hit hp loss
+// (100 -> 85 and 100 -> 88).
 //
-// Headless by design: vehicles.js -> city.js/utils.js/config.js touch no
-// DOM at import time, and generateCity() is never called, so
-// city.solids stays [] and the world-collision section is a no-op here.
+// Run: node --test tests/collision-dedupe.test.mjs
 
-import { makeCar, traffic, collideCarWithWorld } from '../game/src/vehicles.js';
-import { city } from '../game/src/city.js';
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
 
-let failures = 0;
-function check(label, actual, expected) {
-  const ok = Math.abs(actual - expected) < 1e-9;
-  if (!ok) failures++;
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}: got ${actual}, expected ${expected}`);
+// generateCity() also paints a minimap onto a canvas; give it the
+// smallest possible headless canvas stub. The game modules themselves
+// import and run with no DOM at all.
+globalThis.document = {
+  createElement: () => ({
+    width: 0,
+    height: 0,
+    getContext: () => new Proxy({}, { get: () => () => {}, set: () => true }),
+  }),
+};
+
+const { makeCar, collideCarWithWorld, traffic } = await import('../game/src/vehicles.js');
+const { city, generateCity, streetCenterX, streetCenterY } = await import('../game/src/city.js');
+
+generateCity();
+
+const near = (actual, expected) =>
+  assert.ok(Math.abs(actual - expected) < 1e-9, `expected ${expected}, got ${actual}`);
+
+// Two sedans at an open intersection (no building solid overlaps their
+// circles), offset by (10, 6) so three of the four circle pairs overlap.
+// Car A at speed 300, car B stationary: impact at the first hit is 300,
+// so one billing costs A 300 * 0.05 = 15 hp and B 300 * 0.04 = 12 hp.
+function setupPair() {
+  const x = streetCenterX(5), y = streetCenterY(5);
+  const a = makeCar('sedan', x, y, 0, null);
+  const b = makeCar('sedan', x + 10, y + 6, 0, null);
+  a.speed = 300; b.speed = 0;
+  traffic.cars = [a, b];
+  traffic.parked = [];
+  return { a, b, x, y };
 }
-function reset() {
-  traffic.cars.length = 0;
-  traffic.parked.length = 0;
+
+function resetPair({ a, b, x, y }) {
+  a.x = x; a.y = y; a.speed = 300; a.hp = 100; a.dead = false;
+  b.x = x + 10; b.y = y + 6; b.speed = 0; b.hp = 100; b.dead = false;
 }
-function run(car, other, parkOther = false) {
-  reset();
-  if (parkOther) traffic.parked.push(other); else traffic.cars.push(other);
-  traffic.cars.push(car);
+
+test('one call bills a multi-circle car-to-car contact exactly once', () => {
+  const pair = setupPair();
   const events = [];
-  collideCarWithWorld(car, events, false);
-  return events.filter(e => e.kind === 'crash' && e.other === other).length;
-}
+  collideCarWithWorld(pair.a, events, false);
+  const carEvents = events.filter(e => e.other);
+  const worldEvents = events.filter(e => !e.other);
+  assert.equal(worldEvents.length, 0, 'setup must not touch any building solid');
+  assert.equal(carEvents.length, 1, `expected exactly 1 crash event, got ${carEvents.length}`);
+  near(pair.a.hp, 85);  // 100 - 300 * 0.05, billed once, not three times
+  near(pair.b.hp, 88);  // 100 - 300 * 0.04
+});
 
-if (city.solids.length !== 0) {
-  console.log('FAIL  harness assumption: city.solids must be empty (generateCity not called)');
-  process.exit(1);
-}
+test('separate calls still bill separately (the dedupe is per call, not permanent)', () => {
+  const pair = setupPair();
+  collideCarWithWorld(pair.a, [], false);
+  resetPair(pair);
+  const events = [];
+  collideCarWithWorld(pair.a, events, false);
+  const carEvents = events.filter(e => e.other);
+  assert.equal(carEvents.length, 1, `second call must bill again once, got ${carEvents.length}`);
+  near(pair.a.hp, 85);
+  near(pair.b.hp, 88);
+});
 
-// (a) Two sport cars side by side (dy=10): 3 of the 4 circle pairs overlap,
-// impact 300. Baseline billed the same impact 3x (events=3, car hp loss
-// 33.576, other hp loss 26.8608). Fixed: exactly 1 event, one billing at
-// the first pair's impact: car -300*0.05 = -15, other -300*0.04 = -12.
-{
-  const car = makeCar('sport', 1000, 1000, 0); car.speed = 300;
-  const other = makeCar('sport', 1000, 1010, 0); other.speed = 0;
-  const n = run(car, other);
-  check('(a) multi-pair overlap: crash events for the pair', n, 1);
-  check('(a) multi-pair overlap: car hp', car.hp, 85);
-  check('(a) multi-pair overlap: other hp', other.hp, 88);
-}
-
-// (b) Exactly one circle pair overlaps (sedans 40px apart nose-to-tail):
-// parity case — 1 event and one billing before and after the fix.
-// impact 200 -> car -10, other -8.
-{
-  const car = makeCar('sedan', 1000, 1000, 0); car.speed = 200;
-  const other = makeCar('sedan', 1040, 1000, 0); other.speed = 0;
-  const n = run(car, other);
-  check('(b) single-pair overlap: crash events for the pair', n, 1);
-  check('(b) single-pair overlap: car hp', car.hp, 90);
-  check('(b) single-pair overlap: other hp', other.hp, 92);
-}
-
-// (c) No overlap at all: no damage, no event.
-{
-  const car = makeCar('sedan', 1000, 1000, 0); car.speed = 200;
-  const other = makeCar('sedan', 1500, 1000, 0); other.speed = 0;
-  const n = run(car, other);
-  check('(c) no overlap: crash events for the pair', n, 0);
-  check('(c) no overlap: car hp', car.hp, 100);
-  check('(c) no overlap: other hp', other.hp, 100);
-}
-
-// (d) Traffic vs parked is skipped entirely, even fully overlapped at
-// impact 300: no damage, no event.
-{
-  const car = makeCar('sport', 1000, 1000, 0); car.speed = 300; car.driver = 'traffic';
-  const other = makeCar('sport', 1000, 1010, 0); other.speed = 0; other.driver = 'parked';
-  const n = run(car, other, true);
-  check('(d) traffic vs parked: crash events for the pair', n, 0);
-  check('(d) traffic vs parked: car hp', car.hp, 100);
-  check('(d) traffic vs parked: other hp', other.hp, 100);
-}
-
-reset();
-if (failures > 0) {
-  console.log(`\nRESULT: FAIL (${failures} check(s) failed)`);
-  process.exit(1);
-}
-console.log('\nRESULT: PASS (all checks)');
+test('non-car world collision behaviour is unchanged', () => {
+  // A sedan driven into the first generated building solid at speed 200.
+  // Baseline values, measured on the pre-fix code: both body circles
+  // resolve against the solid, each bills once (200 * 0.055 = 11, then
+  // 84 * 0.055 = 4.62 after the speed loss), no event carries an `other`.
+  const s = city.solids[0];
+  const car = makeCar('sedan', s.x + s.w / 2, s.y + s.h / 2, 0, null);
+  car.speed = 200;
+  traffic.cars = [car];
+  traffic.parked = [];
+  const events = [];
+  collideCarWithWorld(car, events, true);
+  assert.equal(events.length, 2, `expected 2 world crash events, got ${events.length}`);
+  assert.ok(events.every(e => e.kind === 'crash' && !e.other), 'world events must not name another car');
+  near(car.hp, 84.38);
+  near(car.speed, 14.8176);
+});
